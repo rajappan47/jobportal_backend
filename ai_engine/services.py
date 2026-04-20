@@ -1,21 +1,35 @@
 import fitz  # PyMuPDF
 from docx import Document
+from sklearn.metrics.pairwise import cosine_similarity
 import re
 import json
 import os
 import time
 from google import genai
+from google.genai import types
 from django.conf import settings
 
-# ✅ Step 1: Initialize Client ONCE at the top
-# Make sure GEMINI_API_KEY is in your .env file
+# =========================================
+# 1. CLIENT INITIALIZATION (With Auto-Retry)
+# =========================================
+# This solves the 503 UNAVAILABLE error by retrying automatically.
 client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY"),
-    http_options={'api_version': 'v1'} 
+    http_options=types.HttpOptions(
+        api_version='v1',
+        retry_options=types.HttpRetryOptions(
+            attempts=4,
+            initial_delay=2.0,
+            http_status_codes=[503, 429, 500]
+        )
+    )
 )
 
+# =========================================
+# 2. FILE EXTRACTION UTILS
+# =========================================
 def extract_text_from_file(file_path):
-    """Automatically extracts text from PDF or DOCX."""
+    """Exactly like your Colab extract_text."""
     text = ""
     try:
         if file_path.endswith(".pdf"):
@@ -30,75 +44,125 @@ def extract_text_from_file(file_path):
         print(f"File extraction error: {e}")
     return text
 
-def safe_json_parse(text):
-    """Cleans AI response and converts to Python Dictionary."""
+def parse_json(text):
+    """Cleans AI response and converts to Dictionary."""
     try:
-        # Removes markdown blocks like ```json ... ```
-        clean_text = re.sub(r'```json|```', '', text).strip()
-        # Find the first { and last } to ignore any text outside the JSON
-        match = re.search(r'\{.*\}', clean_text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        return json.loads(clean_text)
-    except Exception as e:
-        print(f"JSON Parsing Error: {e}")
-        return {
-            "match_score": 0,
-            "is_shortlisted": False,
-            "suggestions": "AI analysis format error."
-        }
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        return json.loads(match.group(0))
+    except:
+        return {"skills": [], "experience": []}
 
+# =========================================
+# 3. HELPER FUNCTIONS (Your Colab Logic)
+# =========================================
+def safe_generate(prompt):
+    """Uses the 2026 Stable Flash model."""
+    return client.models.generate_content(
+        model="gemini-2.0-flash", 
+        contents=prompt
+    )
+
+def get_embedding(text):
+    """Generates vectors for semantic matching."""
+    response = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text[:5000] # Limit to 5k chars for stability
+    )
+    return response.embeddings[0].values
+
+def convert_to_months(duration):
+    duration = duration.lower()
+    years = re.findall(r'(\d+)\s*year', duration)
+    months = re.findall(r'(\d+)\s*month', duration)
+    total = 0
+    if years: total += int(years[0]) * 12
+    if months: total += int(months[0])
+    return total
+
+# =========================================
+# 4. MAIN ATS ENGINE
+# =========================================
 def analyze_application_ats(resume_text, job_description):
     print("--- ATS Engine Started ---")
     
-    # Improved prompt to avoid conversational filler
-    prompt = f"""
-    You are an ATS system. Analyze the following Resume against the Job Description.
-    Return ONLY a JSON object with no preamble or explanation.
-    
-    JD: {job_description}
-    Resume: {resume_text}
+    try:
+        # 1️⃣ Extract Skills & Experience from Resume
+        resume_data_raw = safe_generate(f"""
+        Extract technical skills and work experience. Return ONLY JSON:
+        {{ "skills": ["..."], "experience": [{{"duration": "1 year"}}] }}
+        Text: {resume_text}
+        """)
+        resume_data = parse_json(resume_data_raw.text)
 
-    Format:
-    {{
-      "match_score": <int>,
-      "is_shortlisted": <bool>,
-      "suggestions": "<detailed string explaining why or how to improve>"
-    }}
-    """
+        # 2️⃣ Extract Skills from JD
+        jd_data_raw = safe_generate(f"""
+        Extract ONLY technical skills from this Job Description. Return JSON:
+        {{ "skills": ["java", "spring boot"] }}
+        Text: {job_description}
+        """)
+        jd_data = parse_json(jd_data_raw.text)
 
-    for attempt in range(3):
-        try:
-            print(f"Attempting AI Call {attempt + 1}...")
-            
-            response = client.models.generate_content(
-                model="gemini-2.5-flash", 
-                contents=prompt
-            )
-            
-            if not response.text:
-                raise ValueError("Empty response from Gemini")
+        # 3️⃣ Semantic Skill Matching
+        resume_skills = set([s.lower() for s in resume_data.get("skills", [])])
+        jd_skills = set([s.lower() for s in jd_data.get("skills", [])])
+        
+        skill_prompt = f"""
+        You are an expert recruiter.
+        Candidate Skills: {", ".join(resume_skills)}
+        Job Requirements: {", ".join(jd_skills)}
+        Return JSON: {{ "matched_jd_skills": [] }}
+        """
+        skill_match_res = safe_generate(skill_prompt)
+        matched_data = parse_json(skill_match_res.text)
+        
+        matched_count = len(matched_data.get("matched_jd_skills", []))
+        skill_score = (matched_count / len(jd_skills)) * 100 if jd_skills else 0
 
-            # Use our robust parser
-            result = safe_json_parse(response.text)
-            
-            # ✅ Crucial: Ensure the status field exists for your React Frontend
-            result['status'] = 'shortlisted' if result.get('is_shortlisted') else 'rejected'
-            
-            print("✅ AI Success!")
-            return result
+        # 4️⃣ Experience Scoring
+        resume_months = sum(convert_to_months(job.get("duration", "0")) for job in resume_data.get("experience", []))
+        jd_years_match = re.findall(r'(\d+)\s*(year|years)', job_description.lower())
+        jd_exp_years = int(jd_years_match[0][0]) if jd_years_match else 0
+        
+        if jd_exp_years == 0: exp_score = 100
+        else: exp_score = min(((resume_months / 12) / jd_exp_years) * 100, 100)
 
-        except Exception as e:
-            print(f"❌ Attempt {attempt+1} Error: {str(e)}")
-            # Handle Quota limits
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                print("Quota reached. Sleeping for 40s...")
-                time.sleep(40)
-                continue
-            break
+        # 5️⃣ Embedding Score (Cosine Similarity)
+        resume_emb = get_embedding(resume_text)
+        jd_emb = get_embedding(job_description)
+        embedding_score = cosine_similarity([resume_emb], [jd_emb])[0][0] * 100
 
-    return {
-        "match_score": 0,
-        "status": "rejected",
-        "suggestions": "The AI service is currently unavailable. Please try again in a few minutes."
-    }
+        # 6️⃣ Final Weighted Score
+        final_score = round((embedding_score * 0.5 + skill_score * 0.3 + exp_score * 0.2), 2)
+
+        # 7️⃣ YOUR EXACT COLAB FEEDBACK PROMPT
+        feedback_prompt = f"""
+        Job Description:
+        {job_description}
+
+        Resume:
+        {resume_text}
+
+        Score: {final_score}%
+
+        Explain:
+        - Why rejected
+        - Missing skills
+        - Improvements
+        """
+        feedback_res = safe_generate(feedback_prompt)
+
+        print(f"✅ AI Success! Score: {final_score}")
+        return {
+            "match_score": final_score,
+            "status": "shortlisted" if final_score >= 65 else "rejected",
+            "suggestions": feedback_res.text,
+            "is_shortlisted": final_score >= 65
+        }
+
+    except Exception as e:
+        print(f"❌ Core Error: {str(e)}")
+        return {
+            "match_score": 0,
+            "status": "rejected",
+            "suggestions": f"Technical Issue: {str(e)}. Please try again."
+        }
