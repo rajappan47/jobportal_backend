@@ -75,7 +75,20 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     "corsheaders.middleware.CorsMiddleware",
 ]
-CORS_ALLOW_ALL_ORIGINS = True
+#CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
+]
+
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 ROOT_URLCONF = 'ats_backend.urls'
 
 TEMPLATES = [
@@ -95,7 +108,15 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'ats_backend.wsgi.application'
+# Email Configuration
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
 
+
+# This makes the email look professional in the inbox
+DEFAULT_FROM_EMAIL = f'Recruitment Team <{EMAIL_HOST_USER}>'
 
 # Database
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases

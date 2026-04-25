@@ -9,6 +9,8 @@ class Application(models.Model):
         ('applied', 'Applied'),
         ('shortlisted', 'Shortlisted'),
         ('rejected', 'Rejected'),
+        ('interview', 'Interviewing'),  # HR moves them here
+        ('hired', 'Hired'),
     )
 
     candidate = models.ForeignKey(
